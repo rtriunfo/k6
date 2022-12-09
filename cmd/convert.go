@@ -14,6 +14,7 @@ import (
 )
 
 // TODO: split apart like `k6 run` and `k6 archive`?
+//
 //nolint:funlen,gocognit
 func getCmdConvert(gs *state.GlobalState) *cobra.Command {
 	var (
