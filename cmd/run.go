@@ -24,6 +24,7 @@ import (
 	"go.k6.io/k6/errext"
 	"go.k6.io/k6/errext/exitcodes"
 	"go.k6.io/k6/execution"
+	"go.k6.io/k6/execution/local"
 	"go.k6.io/k6/js/common"
 	"go.k6.io/k6/lib"
 	"go.k6.io/k6/lib/consts"
@@ -33,18 +34,26 @@ import (
 	"go.k6.io/k6/ui/pb"
 )
 
-// cmdRun handles the `k6 run` sub-command
-type cmdRun struct {
+// cmdsRunAndAgent handles the `k6 run` and `k6 agent` sub-commands
+type cmdsRunAndAgent struct {
 	gs *state.GlobalState
+
+	// TODO: figure out something more elegant?
+	loadConfiguredTest func(cmd *cobra.Command, args []string) (*loadedAndConfiguredTest, execution.Controller, error)
+	metricsEngineHook  func(*engine.MetricsEngine) func()
+	testEndHook        func(err error)
 }
 
 // TODO: split apart some more
 //
 //nolint:funlen,gocognit,gocyclo,cyclop
-func (c *cmdRun) run(cmd *cobra.Command, args []string) (err error) {
+func (c *cmdsRunAndAgent) run(cmd *cobra.Command, args []string) (err error) {
 	var logger logrus.FieldLogger = c.gs.Logger
 	defer func() {
 		logger.Debugf("Everything has finished, exiting k6 with error '%s'!", err)
+		if c.testEndHook != nil {
+			c.testEndHook(err)
+		}
 	}()
 	printBanner(c.gs)
 
@@ -61,7 +70,7 @@ func (c *cmdRun) run(cmd *cobra.Command, args []string) (err error) {
 	// from sub-contexts while also attaching a reason for the abort.
 	runCtx, runAbort := execution.NewTestRunContext(lingerCtx, logger)
 
-	test, err := loadAndConfigureTest(c.gs, cmd, args, getConfig)
+	test, controller, err := c.loadConfiguredTest(cmd, args)
 	if err != nil {
 		return err
 	}
@@ -82,7 +91,7 @@ func (c *cmdRun) run(cmd *cobra.Command, args []string) (err error) {
 
 	// Create a local execution scheduler wrapping the runner.
 	logger.Debug("Initializing the execution scheduler...")
-	execScheduler, err := execution.NewScheduler(testRunState)
+	execScheduler, err := execution.NewScheduler(testRunState, controller)
 	if err != nil {
 		return err
 	}
@@ -114,17 +123,22 @@ func (c *cmdRun) run(cmd *cobra.Command, args []string) (err error) {
 		return err
 	}
 
-	executionState := execScheduler.GetState()
-	metricsEngine, err := engine.NewMetricsEngine(executionState)
+	// We'll need to pipe metrics to the MetricsEngine and process them if any
+	// of these are enabled: thresholds, end-of-test summary, engine hook
+	shouldProcessMetrics := (!testRunState.RuntimeOptions.NoSummary.Bool ||
+		!testRunState.RuntimeOptions.NoThresholds.Bool || c.metricsEngineHook != nil)
+	metricsEngine, err := engine.NewMetricsEngine(testRunState, shouldProcessMetrics)
 	if err != nil {
 		return err
 	}
-	if !testRunState.RuntimeOptions.NoSummary.Bool || !testRunState.RuntimeOptions.NoThresholds.Bool {
+
+	if shouldProcessMetrics {
 		// We'll need to pipe metrics to the MetricsEngine if either the
 		// thresholds or the end-of-test summary are enabled.
 		outputs = append(outputs, metricsEngine.CreateIngester())
 	}
 
+	executionState := execScheduler.GetState()
 	if !testRunState.RuntimeOptions.NoSummary.Bool {
 		defer func() {
 			logger.Debug("Generating the end-of-test summary...")
@@ -172,8 +186,14 @@ func (c *cmdRun) run(cmd *cobra.Command, args []string) (err error) {
 		stopOutputs(err)
 	}()
 
+	if c.metricsEngineHook != nil {
+		hookFinalize := c.metricsEngineHook(metricsEngine)
+		defer hookFinalize()
+	}
+
 	if !testRunState.RuntimeOptions.NoThresholds.Bool {
-		finalizeThresholds := metricsEngine.StartThresholdCalculations(runAbort)
+		getCurrentTestDuration := executionState.GetCurrentTestRunDuration
+		finalizeThresholds := metricsEngine.StartThresholdCalculations(getCurrentTestDuration, runAbort)
 		defer func() {
 			// This gets called after the Samples channel has been closed and
 			// the OutputManager has flushed all of the cached samples to
@@ -215,7 +235,6 @@ func (c *cmdRun) run(cmd *cobra.Command, args []string) (err error) {
 		srvCtx, srvCancel := context.WithCancel(globalCtx)
 		defer srvCancel()
 
-		// TODO: send the ExecutionState and MetricsEngine instead of the Engine
 		srv := api.GetServer(runCtx, c.gs.Flags.Address, testRunState, samples, metricsEngine, execScheduler)
 		go func() {
 			defer apiWG.Done()
@@ -242,7 +261,7 @@ func (c *cmdRun) run(cmd *cobra.Command, args []string) (err error) {
 	}
 
 	printExecutionDescription(
-		c.gs, "local", args[0], "", conf, execScheduler.GetState().ExecutionTuple, executionPlan, outputs,
+		c.gs, "local", args[0], "", conf, executionState.ExecutionTuple, executionPlan, outputs,
 	)
 
 	// Trap Interrupts, SIGINTs and SIGTERMs.
@@ -319,7 +338,7 @@ func (c *cmdRun) run(cmd *cobra.Command, args []string) (err error) {
 	return nil
 }
 
-func (c *cmdRun) flagSet() *pflag.FlagSet {
+func (c *cmdsRunAndAgent) flagSet() *pflag.FlagSet {
 	flags := pflag.NewFlagSet("", pflag.ContinueOnError)
 	flags.SortFlags = false
 	flags.AddFlagSet(optionFlagSet())
@@ -329,8 +348,12 @@ func (c *cmdRun) flagSet() *pflag.FlagSet {
 }
 
 func getCmdRun(gs *state.GlobalState) *cobra.Command {
-	c := &cmdRun{
+	c := &cmdsRunAndAgent{
 		gs: gs,
+		loadConfiguredTest: func(cmd *cobra.Command, args []string) (*loadedAndConfiguredTest, execution.Controller, error) {
+			test, err := loadAndConfigureLocalTest(gs, cmd, args, getConfig)
+			return test, local.NewController(), err
+		},
 	}
 
 	runCmd := &cobra.Command{
