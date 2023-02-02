@@ -8,6 +8,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.k6.io/k6/js/modulestest"
+	"go.k6.io/k6/lib"
+	"go.k6.io/k6/metrics"
 )
 
 // traceParentHeaderName is the normalized trace header name.
@@ -142,6 +144,27 @@ func TestClientInstrumentArguments(t *testing.T) {
 		assert.NotNil(t, gotTraceParent)
 		assert.Equal(t, testTraceID, gotTraceParent.String())
 	})
+}
+
+func TestClientInstrumentedCall(t *testing.T) {
+	t.Parallel()
+
+	testCase := newTestCase(t)
+	testCase.testSetup.MoveToVUContext(&lib.State{
+		Tags: lib.NewVUStateTags(&metrics.TagSet{}),
+	})
+	testCase.client.propagator = &W3CPropagator{}
+
+	fn := func(args ...goja.Value) error {
+		gotMetadataTraceID, gotTraceIDKey := testCase.client.vu.State().Tags.GetCurrentValues().Metadata["trace_id"]
+		assert.True(t, gotTraceIDKey)
+		assert.NotEmpty(t, gotMetadataTraceID)
+		return nil
+	}
+
+	_, hasTraceIDKey := testCase.client.vu.State().Tags.GetCurrentValues().Metadata["trace_id"]
+	assert.False(t, hasTraceIDKey)
+	_ = testCase.client.instrumentedCall(fn)
 }
 
 type tracingClientTestCase struct {
