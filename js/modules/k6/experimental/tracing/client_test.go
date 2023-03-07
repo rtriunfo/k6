@@ -5,10 +5,12 @@ import (
 	"testing"
 
 	"github.com/dop251/goja"
+	"github.com/oxtoacart/bpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.k6.io/k6/js/modulestest"
 	"go.k6.io/k6/lib"
+	"go.k6.io/k6/lib/testutils/httpmultibin"
 	"go.k6.io/k6/metrics"
 )
 
@@ -165,6 +167,59 @@ func TestClientInstrumentedCall(t *testing.T) {
 	_, hasTraceIDKey := testCase.client.vu.State().Tags.GetCurrentValues().Metadata["trace_id"]
 	assert.False(t, hasTraceIDKey)
 	_ = testCase.client.instrumentedCall(fn)
+}
+
+func TestSimpleCall(t *testing.T) {
+	t.Parallel()
+
+	testCase := newTestSetup(t)
+	rt := testCase.TestRuntime.VU.Runtime()
+	// Calling in the VU context should fail
+	_, err := testCase.TestRuntime.VU.Runtime().RunString(`
+		instrumentHTTP({propagator: 'w3c'})
+        let http = require('k6/http')
+	`)
+	require.NoError(t, err)
+
+	samples := make(chan metrics.SampleContainer, 1000)
+	tb := httpmultibin.NewHTTPMultiBin(t)
+	testCase.TestRuntime.MoveToVUContext(&lib.State{
+		BuiltinMetrics: metrics.RegisterBuiltinMetrics(testCase.TestRuntime.VU.InitEnvField.Registry),
+		Tags:           lib.NewVUStateTags(testCase.TestRuntime.VU.InitEnvField.Registry.RootTagSet()),
+		Transport:      tb.HTTPTransport,
+		BPool:          bpool.NewBufferPool(1),
+		Samples:        samples,
+		Options:        lib.Options{SystemTags: &metrics.DefaultSystemTagSet},
+	})
+	err = rt.Set("f", func(expected bool, expectedTraceID string) {
+		traceID, gotTraceID := testCase.TestRuntime.VU.State().Tags.GetCurrentValues().Metadata["trace_id"]
+		require.Equal(t, expected, gotTraceID)
+		if expectedTraceID != "" {
+			require.Equal(t, expectedTraceID, traceID)
+		}
+	})
+	require.NoError(t, err)
+
+	t.Cleanup(testCase.TestRuntime.EventLoop.WaitOnRegistered)
+	err = testCase.TestRuntime.EventLoop.Start(func() error {
+		_, err = rt.RunString(tb.Replacer.Replace(`
+        f(false)
+        http.asyncRequest("GET", "HTTPBIN_URL" )
+        f(false)
+        `))
+		return err
+	})
+	require.NoError(t, err)
+	close(samples)
+
+	var sampleRead bool
+	for sampleContainer := range samples {
+		for _, sample := range sampleContainer.GetSamples() {
+			require.NotEmpty(t, sample.Metadata["trace_id"])
+			sampleRead = true
+		}
+	}
+	require.True(t, sampleRead)
 }
 
 type tracingClientTestCase struct {
