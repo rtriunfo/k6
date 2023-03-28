@@ -82,7 +82,7 @@ func allowOnlyOpenedFiles(fs afero.Fs) {
 
 type requireImpl struct {
 	vu      modules.VU
-	modules *moduleSystem
+	modules *modules.ModuleSystem
 	pwd     *url.URL
 }
 
