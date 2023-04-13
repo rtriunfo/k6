@@ -20,36 +20,83 @@ const (
 
 	// metadataTraceIDKeyName is the key name of the traceID in the output metadata.
 	metadataTraceIDKeyName = "trace_id"
+
+	// traceIDEncodedSize is the size of the encoded traceID.
+	traceIDEncodedSize = 16
 )
 
-// TraceID represents a trace-id as defined by the [W3c specification], and
+// newTraceID generates a new trace ID.
+//
+// Because the trace ID relies on randomness, and its underlying serialization
+// depends on the time, it is mandatory to use this function to generate
+// trace IDs, instead of creating them manually.
+func newTraceID(prefix int16, code int8, t time.Time, randSource io.Reader) (traceID, error) {
+	if prefix != k6Prefix {
+		return traceID{}, fmt.Errorf("invalid prefix 0o%o, expected 0o%o", prefix, k6Prefix)
+	}
+
+	if (code != k6CloudCode) && (code != k6LocalCode) {
+		return traceID{}, fmt.Errorf("invalid code 0o%d, accepted values are 0o%d and 0o%d", code, k6CloudCode, k6LocalCode)
+	}
+
+	// Encode The trace ID into a binary buffer.
+	buf := make([]byte, traceIDEncodedSize)
+	n := binary.PutVarint(buf, int64(prefix))
+	n += binary.PutVarint(buf[n:], int64(code))
+	n += binary.PutVarint(buf[n:], t.UnixNano())
+
+	// Calculate the number of random bytes needed.
+	randomBytesSize := traceIDEncodedSize - n
+
+	// Generate the random bytes.
+	randomness := make([]byte, randomBytesSize)
+	err := binary.Read(randSource, binary.BigEndian, randomness)
+	if err != nil {
+		return traceID{}, fmt.Errorf("failed to generate random bytes from os; reason: %w", err)
+	}
+
+	// Combine the values and random bytes to form the encoded trace ID buffer.
+	buf = append(buf[:n], randomness...)
+
+	return traceID{
+		prefix:           prefix,
+		code:             code,
+		time:             t,
+		randomizedSuffix: randomness,
+		serialized:       buf,
+	}, nil
+}
+
+// traceID represents a trace-id as defined by the [W3c specification], and
 // used by w3c, b3 and jaeger propagators. See Considerations for trace-id field [generation]
 // for more information.
 //
 // [W3c specification]: https://www.w3.org/TR/trace-context/#trace-id
 // [generation]: https://www.w3.org/TR/trace-context/#considerations-for-trace-id-field-generation
-type TraceID struct {
-	// Prefix is the first 2 bytes of the trace-id, and is used to identify the
+type traceID struct {
+	// prefix is the first 2 bytes of the trace-id, and is used to identify the
 	// vendor of the trace-id.
-	Prefix int16
+	prefix int16
 
-	// Code is the third byte of the trace-id, and is used to identify the
+	// code is the third byte of the trace-id, and is used to identify the
 	// vendor's specific trace-id format.
-	Code int8
+	code int8
 
-	// Time is the time at which the trace-id was generated.
+	// time is the time at which the trace-id was generated.
 	//
 	// The time component is used as a source of randomness, and to ensure
 	// uniqueness of the trace-id.
 	//
 	// When encoded, it should be in a format occupying the last 8 bytes of
 	// the trace-id, and should ideally be encoded as nanoseconds.
-	Time time.Time
+	time time.Time
 
-	// randSource holds the randomness source to use when encoding the
-	// trace-id. The `rand.Reader` should be your default pick. But
-	// you can replace it with a different source for testing purposes.
-	randSource io.Reader
+	// randomizedSuffix holds the random bytes suffix that are used to ensure uniqueness of the
+	// trace-id.
+	randomizedSuffix []byte
+
+	// serialized holds the serialized trace-id.
+	serialized []byte
 }
 
 // Encode encodes the TraceID into a hex string.
@@ -61,43 +108,14 @@ type TraceID struct {
 // 4. The remaining bytes are filled with random bytes.
 //
 // The resulting 16 bytes sequence is then encoded as a hex string.
-func (t TraceID) Encode() (string, error) {
-	if !t.isValid() {
-		return "", fmt.Errorf("failed to encode traceID: %v", t)
+func (t traceID) Encode() (string, error) {
+	if t.serialized == nil {
+		return "", fmt.Errorf("serialized traceID is not set")
 	}
 
-	// TraceID is specified to be 16 bytes long.
-	buf := make([]byte, 16)
-
-	// The `PutVarint` and `PutUvarint` functions encode the given value into
-	// the provided buffer, and return the number of bytes written. Thus, it
-	// allows us to keep track of the number of bytes written, as we go, and
-	// to pack the values to use as less space as possible.
-	n := binary.PutVarint(buf, int64(t.Prefix))
-	n += binary.PutVarint(buf[n:], int64(t.Code))
-	n += binary.PutVarint(buf[n:], t.Time.UnixNano())
-
-	// The rest of the space in the 16 bytes buffer, equivalent to the number
-	// of available bytes left after writing the prefix, code and timestamp (index n)
-	// is filled with random bytes.
-	randomness := make([]byte, 16-n)
-	err := binary.Read(t.randSource, binary.BigEndian, randomness)
-	if err != nil {
-		return "", fmt.Errorf("failed to read random bytes from os; reason: %w", err)
+	if len(t.serialized) != traceIDEncodedSize {
+		return "", fmt.Errorf("serialized traceID has incorrect length: %d", len(t.serialized))
 	}
 
-	buf = append(buf[:n], randomness...)
-	hx := hex.EncodeToString(buf)
-
-	return hx, nil
-}
-
-func (t TraceID) isValid() bool {
-	var (
-		isk6Prefix = t.Prefix == k6Prefix
-		isk6Cloud  = t.Code == k6CloudCode
-		isk6Local  = t.Code == k6LocalCode
-	)
-
-	return isk6Prefix && (isk6Cloud || isk6Local)
+	return hex.EncodeToString(t.serialized), nil
 }

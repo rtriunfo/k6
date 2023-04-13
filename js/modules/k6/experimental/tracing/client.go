@@ -228,11 +228,9 @@ func (c *Client) instrumentedCall(call func(args ...goja.Value) error, args ...g
 }
 
 func (c *Client) generateTraceContext() (http.Header, string, error) {
-	traceID := TraceID{
-		Prefix:     k6Prefix,
-		Code:       k6CloudCode,
-		Time:       time.Now(),
-		randSource: c.randSource,
+	traceID, err := newTraceID(k6Prefix, k6CloudCode, time.Now(), c.randSource)
+	if err != nil {
+		return http.Header{}, "", fmt.Errorf("failed to generate trace ID; reason: %w", err)
 	}
 
 	encodedTraceID, err := traceID.Encode()
